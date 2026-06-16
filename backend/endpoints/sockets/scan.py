@@ -10,6 +10,7 @@ from rq import Worker
 from rq.job import Job
 
 from config import DEV_MODE, REDIS_URL, SCAN_TIMEOUT, SCAN_WORKERS, TASK_RESULT_TTL
+from config.config_manager import config_manager as cm
 from endpoints.responses import TaskType
 from endpoints.responses.platform import PlatformSchema
 from endpoints.responses.rom import SimpleRomSchema
@@ -27,6 +28,7 @@ from handler.filesystem import (
     fs_rom_handler,
 )
 from handler.filesystem.roms_handler import FSRom
+from handler.metadata import meta_gamelist_handler
 from handler.metadata.ss_handler import get_preferred_media_types
 from handler.redis_handler import get_job_func_name, high_prio_queue, redis_client
 from handler.scan_handler import (
@@ -102,7 +104,7 @@ class ScanStats:
 
 def _get_socket_manager() -> socketio.AsyncRedisManager:
     """Connect to external socketio server"""
-    return socketio.AsyncRedisManager(str(REDIS_URL), write_only=True)
+    return socketio.AsyncRedisManager(REDIS_URL, write_only=True)
 
 
 async def _identify_firmware(
@@ -186,7 +188,10 @@ def _should_scan_rom(
 
 
 def _should_get_rom_files(
-    scan_type: ScanType, rom: Rom, newly_added: bool, roms_ids: list[int]
+    scan_type: ScanType,
+    rom: Rom,
+    newly_added: bool,
+    roms_ids: list[int],
 ) -> bool:
     """Decide if the files of a rom should be rebuilt or not
 
@@ -196,6 +201,13 @@ def _should_get_rom_files(
         newly_added (bool): Whether the rom is newly added.
         roms_ids (list[int]): List of selected roms to be scanned.
     """
+    # Get hash calculation setting from config
+    calculate_hashes = not cm.get_config().SKIP_HASH_CALCULATION
+
+    # Skip file processing entirely if hashes are disabled (except for HASHES scan type)
+    if not calculate_hashes and scan_type != ScanType.HASHES:
+        return False
+
     return bool(
         (scan_type in {ScanType.NEW_PLATFORMS, ScanType.QUICK} and newly_added)
         or (scan_type == ScanType.COMPLETE)
@@ -219,6 +231,7 @@ async def _identify_rom(
     metadata_sources: list[str],
     socket_manager: socketio.AsyncRedisManager,
     scan_stats: ScanStats,
+    calculate_hashes: bool = True,
 ) -> None:
     # Break early if the flag is set
     if redis_client.get(STOP_SCAN_FLAG):
@@ -272,13 +285,23 @@ async def _identify_rom(
 
     # Build rom files object before scanning
     should_update_files = _should_get_rom_files(
-        scan_type=scan_type, rom=rom, newly_added=newly_added, roms_ids=roms_ids
+        scan_type=scan_type,
+        rom=rom,
+        newly_added=newly_added,
+        roms_ids=roms_ids,
     )
     if should_update_files:
-        log.debug(f"Calculating file hashes for {rom.fs_name}...")
-        rom_files, rom_crc_c, rom_md5_h, rom_sha1_h, rom_ra_h = (
-            await fs_rom_handler.get_rom_files(rom)
-        )
+        # Get hash calculation setting from config
+        calculate_hashes = not cm.get_config().SKIP_HASH_CALCULATION
+        if calculate_hashes:
+            log.debug(f"Calculating file hashes for {rom.fs_name}...")
+        (
+            rom_files,
+            rom_crc_c,
+            rom_md5_h,
+            rom_sha1_h,
+            rom_ra_h,
+        ) = await fs_rom_handler.get_rom_files(rom, calculate_hashes=calculate_hashes)
         fs_rom.update(
             {
                 "files": rom_files,
@@ -428,6 +451,7 @@ async def _identify_platform(
     metadata_sources: list[str],
     socket_manager: socketio.AsyncRedisManager,
     scan_stats: ScanStats,
+    calculate_hashes: bool = True,
 ) -> ScanStats:
     # Stop the scan if the flag is set
     if redis_client.get(STOP_SCAN_FLAG):
@@ -449,6 +473,9 @@ async def _identify_platform(
     )
 
     platform = db_platform_handler.add_platform(scanned_platform)
+
+    # Preparse the platform's gamelist.xml file and cache it
+    await meta_gamelist_handler.populate_cache(platform)
 
     await socket_manager.emit(
         "scan:scanning_platform",
@@ -513,6 +540,7 @@ async def _identify_platform(
                 metadata_sources=metadata_sources,
                 socket_manager=socket_manager,
                 scan_stats=scan_stats,
+                calculate_hashes=calculate_hashes,
             )
 
     for fs_roms_batch in batched(fs_roms, 200, strict=False):
@@ -570,6 +598,9 @@ async def scan_platforms(
         roms_ids (list[int], optional): List of selected roms to be scanned.
     """
 
+    # Get hash calculation setting from config
+    calculate_hashes = not cm.get_config().SKIP_HASH_CALCULATION
+
     if not roms_ids:
         roms_ids = []
 
@@ -582,6 +613,9 @@ async def scan_platforms(
         log.error(e)
         await socket_manager.emit("scan:done_ko", e.message)
         return scan_stats
+
+    # Clear the gamelist cache  to ensure we're using fresh gamelist.xml data
+    meta_gamelist_handler.clear_cache()
 
     # Precalculate total platforms and ROMs
     total_roms = 0
@@ -626,6 +660,7 @@ async def scan_platforms(
                 metadata_sources=metadata_sources,
                 socket_manager=socket_manager,
                 scan_stats=scan_stats,
+                calculate_hashes=calculate_hashes,
             )
 
         missed_platforms = db_platform_handler.mark_missing_platforms(fs_platforms)

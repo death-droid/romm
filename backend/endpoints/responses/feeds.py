@@ -213,6 +213,19 @@ class PKGiFeedPSVitaItemSchema(BaseModel):
     checksum: str
 
 
+# FPKGi feed format
+# Source: https://github.com/ItsJokerZz/FPKGi
+class FPKGiFeedItemSchema(BaseModel):
+    name: str
+    size: int
+    title_id: str
+    region: str | None
+    version: str | None
+    release: str | None
+    min_fw: str | None
+    cover_url: str | None
+
+
 # Kekatsu DS feed format
 # Source: https://github.com/cavv-dev/Kekatsu-DS
 class KekatsuDSItemSchema(BaseModel):
